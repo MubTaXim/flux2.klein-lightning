@@ -49,37 +49,46 @@ def get_model_info():
 
 
 def load_models(cpu_offload: bool = True, progress=None):
-    """Load all model components."""
+    """Load all model components.
+    
+    Optimized strategy for L4 (24GB):
+    - Text encoder on CPU (9GB) - runs slower but avoids PCIe transfer
+    - Flow model on GPU (18GB) - stays permanently, never moves
+    - VAE on GPU (0.3GB) - stays permanently
+    Total GPU: 18.3GB - fits comfortably!
+    """
     global model, text_encoder, ae, is_loaded
     
     if is_loaded:
         return
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if progress:
+        progress(0.1, desc="Loading text encoder (CPU)...")
+    print("Loading text encoder (on CPU to save GPU VRAM)...")
+    # Text encoder stays on CPU - we'll run inference on CPU
+    # This is slower but avoids expensive PCIe transfers
+    text_encoder = load_text_encoder(MODEL_NAME, device="cpu")
     
     if progress:
-        progress(0.1, desc="Loading text encoder...")
-    print("Loading text encoder...")
-    text_encoder = load_text_encoder(MODEL_NAME, device=device)
+        progress(0.4, desc="Loading flow model (GPU)...")
+    print("Loading flow model (on GPU - stays permanently)...")
+    # Flow model goes directly to GPU and stays there
+    model = load_flow_model(MODEL_NAME, device="cuda")
     
     if progress:
-        progress(0.4, desc="Loading flow model...")
-    print("Loading flow model...")
-    model = load_flow_model(
-        MODEL_NAME,
-        device="cpu" if cpu_offload else device
-    )
-    
-    if progress:
-        progress(0.7, desc="Loading autoencoder...")
-    print("Loading autoencoder...")
-    ae = load_ae(MODEL_NAME, device=device)
+        progress(0.7, desc="Loading autoencoder (GPU)...")
+    print("Loading autoencoder (on GPU - stays permanently)...")
+    # VAE on GPU - only 0.3GB
+    ae = load_ae(MODEL_NAME, device="cuda")
     ae.eval()
     
     is_loaded = True
     if progress:
         progress(0.9, desc="Models loaded!")
-    print("✓ All models loaded!")
+    
+    vram = torch.cuda.memory_allocated() / 1024**3
+    print(f"✓ All models loaded! GPU VRAM: {vram:.1f}GB")
+
 
 
 def generate_image(
@@ -88,7 +97,6 @@ def generate_image(
     height: int,
     seed: int,
     input_images: list = None,
-    cpu_offload: bool = True,
     progress=gr.Progress()
 ):
     """Generate image using FLUX.2 Klein 9B."""
@@ -136,36 +144,23 @@ def generate_image(
                         else:
                             img_ctx.append(Image.open(img_file))
                 if img_ctx:
-                    # Make sure AE is on GPU for encoding
-                    ae.cuda()
+                    # AE is already on GPU with our optimized loading strategy
                     ref_tokens, ref_ids = encode_image_refs(ae, img_ctx)
                 log(f"Encoded {len(img_ctx)} reference images")
             
-            # Step 2: Encode text
-            log("Encoding prompt...")
-            progress(0.2, desc="Encoding prompt...")
+            # Step 2: Encode text (ON CPU - slower but no transfer!)
+            log("Encoding prompt (on CPU)...")
+            progress(0.2, desc="Encoding prompt (CPU)...")
             
-            # Make sure text encoder is on GPU
-            text_encoder.cuda()
-            ctx = text_encoder([prompt]).to(torch.bfloat16)
+            # Text encoder runs on CPU, then we move just the embeddings to GPU
+            # Embeddings are tiny (~1MB) so transfer is instant
+            encode_start = time.time()
+            ctx = text_encoder([prompt])  # Runs on CPU
+            ctx = ctx.to(device="cuda", dtype=torch.bfloat16)  # Move tiny output to GPU
             ctx, ctx_ids = batched_prc_txt(ctx)
-            log("Prompt encoded")
+            log(f"Prompt encoded in {time.time() - encode_start:.1f}s (CPU inference)")
             
-            # Step 3: Prepare models for denoising
-            if cpu_offload:
-                log("CPU offload: moving text encoder to CPU, flow model to GPU...")
-                text_encoder.cpu()
-                ae.cpu()  # Move AE off too
-                torch.cuda.empty_cache()
-                model.cuda()
-                log("Flow model on GPU")
-            else:
-                # No CPU offload - ensure everything is on GPU
-                log("No CPU offload: ensuring all models are on GPU...")
-                text_encoder.cuda()
-                model.cuda()
-                ae.cuda()
-                log("All models on GPU (no offload)")
+            # Step 3: No model movement needed - flow model already on GPU!
             
             # Step 4: Create noise
             progress(0.3, desc="Creating noise...")
@@ -174,13 +169,13 @@ def generate_image(
             randn = torch.randn(shape, generator=generator, dtype=torch.bfloat16, device="cuda")
             x, x_ids = batched_prc_img(randn)
             
-            # Step 5: Denoise
+            # Step 5: Denoise (model already on GPU!)
             log(f"Denoising ({num_steps} steps)...")
             progress(0.4, desc=f"Denoising ({num_steps} steps)...")
             timesteps = get_schedule(num_steps, x.shape[1])
             denoise_start = time.time()
             x = denoise(
-                model,
+                model,  # Already on GPU!
                 x,
                 x_ids,
                 ctx,
@@ -192,30 +187,13 @@ def generate_image(
             )
             log(f"Denoising complete in {time.time() - denoise_start:.1f}s")
             
-            # Step 6: Move flow model off, AE on
+            # Step 6: Decode (VAE already on GPU!)
             progress(0.8, desc="Decoding...")
-            if cpu_offload:
-                log("CPU offload: moving flow model to CPU, AE to GPU...")
-                model.cpu()
-                torch.cuda.empty_cache()
-                ae.cuda()
-                log("AE on GPU")
-            else:
-                # Already on GPU, just log
-                log("AE already on GPU (no offload)")
-            
-            # Step 7: Decode
             log("Decoding latents...")
             decode_start = time.time()
             x = torch.cat(scatter_ids(x, x_ids)).squeeze(2)
-            x = ae.decode(x).float()
+            x = ae.decode(x).float()  # Already on GPU!
             log(f"Decode complete in {time.time() - decode_start:.1f}s")
-            
-            # CPU offload: prepare for next generation
-            if cpu_offload:
-                ae.cpu()
-                torch.cuda.empty_cache()
-                text_encoder.cuda()  # Ready for next prompt
         
         # Convert to PIL
         x = x.clamp(-1, 1)
@@ -292,11 +270,6 @@ def create_ui():
                         label="Seed (-1 = random)",
                         precision=0
                     )
-                    cpu_offload = gr.Checkbox(
-                        value=True,
-                        label="CPU Offload",
-                        info="Required for GPUs with <32GB VRAM"
-                    )
                 
                 with gr.Accordion("📷 Reference Images (Optional)", open=False):
                     gr.Markdown("Upload reference images for image-to-image editing")
@@ -319,7 +292,8 @@ def create_ui():
                 **Model Info:**
                 - Steps: `{model_info['num_steps']}` (fixed)
                 - Guidance: `{model_info['guidance']}` (fixed)
-                - VRAM: ~29GB (with offload: ~20GB peak)
+                - GPU VRAM: ~18.5GB (optimized for L4)
+                - Text encoder runs on CPU
                 """)
             
             # Right column - Output
@@ -350,14 +324,14 @@ def create_ui():
         # Connect events
         generate_btn.click(
             fn=generate_image,
-            inputs=[prompt, width, height, seed, ref_images, cpu_offload],
+            inputs=[prompt, width, height, seed, ref_images],
             outputs=[output_image, status]
         )
         
         # Also generate on Enter key in prompt
         prompt.submit(
             fn=generate_image,
-            inputs=[prompt, width, height, seed, ref_images, cpu_offload],
+            inputs=[prompt, width, height, seed, ref_images],
             outputs=[output_image, status]
         )
     
