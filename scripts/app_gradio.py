@@ -48,14 +48,17 @@ def get_model_info():
     }
 
 
-def load_models(cpu_offload: bool = True, progress=None):
-    """Load all model components.
+def load_models(progress=None):
+    """Load all model components with CPU offload strategy.
     
-    Optimized strategy for L4 (24GB):
-    - Text encoder on CPU (9GB) - runs slower but avoids PCIe transfer
-    - Flow model on GPU (18GB) - stays permanently, never moves
-    - VAE on GPU (0.3GB) - stays permanently
-    Total GPU: 18.3GB - fits comfortably!
+    For L4 (24GB) we can't fit all models on GPU at once:
+    - Text encoder: 9GB
+    - Flow model: 18GB  
+    - VAE: 0.3GB
+    - Total: 27.3GB > 22.3GB available
+    
+    Strategy: Load text encoder + VAE on GPU, flow model on CPU.
+    During inference, swap flow model onto GPU when needed.
     """
     global model, text_encoder, ae, is_loaded
     
@@ -63,22 +66,19 @@ def load_models(cpu_offload: bool = True, progress=None):
         return
     
     if progress:
-        progress(0.1, desc="Loading text encoder (CPU)...")
-    print("Loading text encoder (on CPU to save GPU VRAM)...")
-    # Text encoder stays on CPU - we'll run inference on CPU
-    # This is slower but avoids expensive PCIe transfers
-    text_encoder = load_text_encoder(MODEL_NAME, device="cpu")
+        progress(0.1, desc="Loading text encoder (GPU)...")
+    print("Loading text encoder (on GPU)...")
+    text_encoder = load_text_encoder(MODEL_NAME, device="cuda")
     
     if progress:
-        progress(0.4, desc="Loading flow model (GPU)...")
-    print("Loading flow model (on GPU - stays permanently)...")
-    # Flow model goes directly to GPU and stays there
-    model = load_flow_model(MODEL_NAME, device="cuda")
+        progress(0.4, desc="Loading flow model (CPU - will swap to GPU)...")
+    print("Loading flow model (on CPU - will swap to GPU during inference)...")
+    # Flow model starts on CPU, will be moved to GPU when needed
+    model = load_flow_model(MODEL_NAME, device="cpu")
     
     if progress:
         progress(0.7, desc="Loading autoencoder (GPU)...")
-    print("Loading autoencoder (on GPU - stays permanently)...")
-    # VAE on GPU - only 0.3GB
+    print("Loading autoencoder (on GPU)...")
     ae = load_ae(MODEL_NAME, device="cuda")
     ae.eval()
     
@@ -87,7 +87,8 @@ def load_models(cpu_offload: bool = True, progress=None):
         progress(0.9, desc="Models loaded!")
     
     vram = torch.cuda.memory_allocated() / 1024**3
-    print(f"✓ All models loaded! GPU VRAM: {vram:.1f}GB")
+    print(f"✓ All models loaded! GPU VRAM: {vram:.1f}GB (flow model on CPU)")
+
 
 
 
@@ -144,38 +145,42 @@ def generate_image(
                         else:
                             img_ctx.append(Image.open(img_file))
                 if img_ctx:
-                    # AE is already on GPU with our optimized loading strategy
+                    # AE is on GPU
                     ref_tokens, ref_ids = encode_image_refs(ae, img_ctx)
                 log(f"Encoded {len(img_ctx)} reference images")
             
-            # Step 2: Encode text (ON CPU - slower but no transfer!)
-            log("Encoding prompt (on CPU)...")
-            progress(0.2, desc="Encoding prompt (CPU)...")
+            # Step 2: Encode text (text encoder is on GPU)
+            log("Encoding prompt...")
+            progress(0.2, desc="Encoding prompt...")
             
-            # Text encoder runs on CPU, then we move just the embeddings to GPU
-            # Embeddings are tiny (~1MB) so transfer is instant
             encode_start = time.time()
-            ctx = text_encoder([prompt])  # Runs on CPU
-            ctx = ctx.to(device="cuda", dtype=torch.bfloat16)  # Move tiny output to GPU
+            ctx = text_encoder([prompt]).to(torch.bfloat16)
             ctx, ctx_ids = batched_prc_txt(ctx)
-            log(f"Prompt encoded in {time.time() - encode_start:.1f}s (CPU inference)")
+            log(f"Prompt encoded in {time.time() - encode_start:.1f}s")
             
-            # Step 3: No model movement needed - flow model already on GPU!
+            # Step 3: Swap models - move text encoder OFF, flow model ON
+            log("Swapping: text encoder → CPU, flow model → GPU...")
+            progress(0.3, desc="Loading flow model to GPU...")
+            swap_start = time.time()
+            text_encoder.cpu()
+            ae.cpu()
+            torch.cuda.empty_cache()
+            model.cuda()
+            log(f"Flow model on GPU in {time.time() - swap_start:.1f}s")
             
             # Step 4: Create noise
-            progress(0.3, desc="Creating noise...")
             shape = (1, 128, height // 16, width // 16)
             generator = torch.Generator(device="cuda").manual_seed(actual_seed)
             randn = torch.randn(shape, generator=generator, dtype=torch.bfloat16, device="cuda")
             x, x_ids = batched_prc_img(randn)
             
-            # Step 5: Denoise (model already on GPU!)
+            # Step 5: Denoise
             log(f"Denoising ({num_steps} steps)...")
-            progress(0.4, desc=f"Denoising ({num_steps} steps)...")
+            progress(0.5, desc=f"Denoising ({num_steps} steps)...")
             timesteps = get_schedule(num_steps, x.shape[1])
             denoise_start = time.time()
             x = denoise(
-                model,  # Already on GPU!
+                model,
                 x,
                 x_ids,
                 ctx,
@@ -187,13 +192,26 @@ def generate_image(
             )
             log(f"Denoising complete in {time.time() - denoise_start:.1f}s")
             
-            # Step 6: Decode (VAE already on GPU!)
+            # Step 6: Swap models - move flow model OFF, VAE ON
+            log("Swapping: flow model → CPU, VAE → GPU...")
             progress(0.8, desc="Decoding...")
+            swap_start = time.time()
+            model.cpu()
+            torch.cuda.empty_cache()
+            ae.cuda()
+            log(f"VAE on GPU in {time.time() - swap_start:.1f}s")
+            
+            # Step 7: Decode
             log("Decoding latents...")
             decode_start = time.time()
             x = torch.cat(scatter_ids(x, x_ids)).squeeze(2)
-            x = ae.decode(x).float()  # Already on GPU!
+            x = ae.decode(x).float()
             log(f"Decode complete in {time.time() - decode_start:.1f}s")
+            
+            # Prepare for next generation
+            ae.cpu()
+            torch.cuda.empty_cache()
+            text_encoder.cuda()
         
         # Convert to PIL
         x = x.clamp(-1, 1)
