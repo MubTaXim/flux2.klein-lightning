@@ -118,7 +118,7 @@ def generate_image(
     # Load models if needed
     if not is_loaded:
         progress(0.05, desc="Loading models (first run)...")
-        load_models(cpu_offload, progress)
+        load_models(progress=progress)
     
     # Get fixed parameters for Klein 9B distilled
     model_info = get_model_info()
