@@ -121,34 +121,24 @@ def load_ae(model_name: str, device: str | torch.device = "cuda") -> AutoEncoder
         weight_path = os.environ["AE_MODEL_PATH"]
         assert os.path.exists(weight_path), f"Provided weight path {weight_path} does not exist"
     else:
-        # download from huggingface
-        # Try multiple possible filenames - BFL repos use different naming conventions
-        possible_filenames = [
-            "vae/diffusion_pytorch_model.safetensors",  # New FLUX.2 format
-            config["filename_ae"],  # Original ae.safetensors
-        ]
+        # The VAE files in the Klein repos use Diffusers format which is incompatible
+        # with the BFL AutoEncoder class. Use ai-toolkit/flux2_vae which has the 
+        # correct BFL-format ae.safetensors file.
+        ae_repo_id = "ai-toolkit/flux2_vae"
+        ae_filename = "ae.safetensors"
         
-        weight_path = None
-        last_error = None
-        
-        for filename in possible_filenames:
-            try:
-                weight_path = huggingface_hub.hf_hub_download(
-                    repo_id=config["repo_id"],
-                    filename=filename,
-                    repo_type="model",
-                )
-                print(f"Found VAE at: {filename}")
-                break
-            except Exception as e:
-                last_error = e
-                continue
-        
-        if weight_path is None:
+        try:
+            weight_path = huggingface_hub.hf_hub_download(
+                repo_id=ae_repo_id,
+                filename=ae_filename,
+                repo_type="model",
+            )
+            print(f"Found VAE at: {ae_repo_id}/{ae_filename}")
+        except Exception as e:
             print(
-                f"Failed to access the VAE. Tried: {possible_filenames}. "
-                f"Please check your internet connection and make sure you've access to {config['repo_id']}. "
-                f"Last error: {last_error}"
+                f"Failed to download VAE from {ae_repo_id}. "
+                f"Error: {e}. "
+                "You can manually set AE_MODEL_PATH environment variable."
             )
             sys.exit(1)
 
