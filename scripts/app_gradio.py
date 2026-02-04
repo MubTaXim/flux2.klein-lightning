@@ -93,9 +93,19 @@ def generate_image(
 ):
     """Generate image using FLUX.2 Klein 9B."""
     global model, text_encoder, ae
+    import time
     
     if not prompt.strip():
         return None, "⚠️ Please enter a prompt"
+    
+    start_time = time.time()
+    
+    def log(msg):
+        elapsed = time.time() - start_time
+        vram = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+        print(f"[{elapsed:6.1f}s] [VRAM: {vram:.1f}GB] {msg}")
+    
+    log(f"Starting generation: {prompt[:50]}...")
     
     # Load models if needed
     if not is_loaded:
@@ -109,16 +119,15 @@ def generate_image(
     
     # Handle seed
     actual_seed = seed if seed >= 0 else random.randrange(2**31)
-    
-    progress(0.2, desc="Encoding prompt...")
-    
-    torch_device = torch.device("cuda")
+    log(f"Seed: {actual_seed}, Size: {width}x{height}, Steps: {num_steps}")
     
     try:
         with torch.no_grad():
-            # Encode reference images if provided
+            # Step 1: Encode reference images if provided
             ref_tokens, ref_ids = None, None
             if input_images and len(input_images) > 0:
+                log("Encoding reference images...")
+                progress(0.15, desc="Encoding reference images...")
                 img_ctx = []
                 for img_file in input_images:
                     if img_file is not None:
@@ -127,29 +136,42 @@ def generate_image(
                         else:
                             img_ctx.append(Image.open(img_file))
                 if img_ctx:
+                    # Make sure AE is on GPU for encoding
+                    ae.cuda()
                     ref_tokens, ref_ids = encode_image_refs(ae, img_ctx)
+                log(f"Encoded {len(img_ctx)} reference images")
             
-            # Encode text - Klein uses Qwen3 embedder
+            # Step 2: Encode text
+            log("Encoding prompt...")
+            progress(0.2, desc="Encoding prompt...")
+            
+            # Make sure text encoder is on GPU
+            text_encoder.cuda()
             ctx = text_encoder([prompt]).to(torch.bfloat16)
             ctx, ctx_ids = batched_prc_txt(ctx)
+            log("Prompt encoded")
             
-            progress(0.4, desc="Generating...")
-            
-            # CPU offload management
+            # Step 3: Move text encoder off, flow model on
             if cpu_offload:
+                log("CPU offload: moving text encoder to CPU, flow model to GPU...")
                 text_encoder.cpu()
+                ae.cpu()  # Move AE off too
                 torch.cuda.empty_cache()
                 model.cuda()
+                log("Flow model on GPU")
             
-            # Create noise
+            # Step 4: Create noise
+            progress(0.3, desc="Creating noise...")
             shape = (1, 128, height // 16, width // 16)
             generator = torch.Generator(device="cuda").manual_seed(actual_seed)
             randn = torch.randn(shape, generator=generator, dtype=torch.bfloat16, device="cuda")
             x, x_ids = batched_prc_img(randn)
             
-            # Denoise
-            progress(0.5, desc=f"Denoising ({num_steps} steps)...")
+            # Step 5: Denoise
+            log(f"Denoising ({num_steps} steps)...")
+            progress(0.4, desc=f"Denoising ({num_steps} steps)...")
             timesteps = get_schedule(num_steps, x.shape[1])
+            denoise_start = time.time()
             x = denoise(
                 model,
                 x,
@@ -161,18 +183,29 @@ def generate_image(
                 img_cond_seq=ref_tokens,
                 img_cond_seq_ids=ref_ids,
             )
+            log(f"Denoising complete in {time.time() - denoise_start:.1f}s")
             
+            # Step 6: Move flow model off, AE on
             progress(0.8, desc="Decoding...")
-            
-            # Decode
-            x = torch.cat(scatter_ids(x, x_ids)).squeeze(2)
-            x = ae.decode(x).float()
-            
-            # CPU offload: swap back
             if cpu_offload:
+                log("CPU offload: moving flow model to CPU, AE to GPU...")
                 model.cpu()
                 torch.cuda.empty_cache()
-                text_encoder.cuda()
+                ae.cuda()
+                log("AE on GPU")
+            
+            # Step 7: Decode
+            log("Decoding latents...")
+            decode_start = time.time()
+            x = torch.cat(scatter_ids(x, x_ids)).squeeze(2)
+            x = ae.decode(x).float()
+            log(f"Decode complete in {time.time() - decode_start:.1f}s")
+            
+            # CPU offload: prepare for next generation
+            if cpu_offload:
+                ae.cpu()
+                torch.cuda.empty_cache()
+                text_encoder.cuda()  # Ready for next prompt
         
         # Convert to PIL
         x = x.clamp(-1, 1)
@@ -185,10 +218,15 @@ def generate_image(
         output_path = output_dir / f"flux2_klein_{actual_seed}.png"
         img.save(output_path, quality=95)
         
+        total_time = time.time() - start_time
+        log(f"✓ Complete! Total time: {total_time:.1f}s")
+        
         progress(1.0, desc="Done!")
-        return img, f"✓ Saved to {output_path} | Seed: {actual_seed} | Size: {width}x{height}"
+        return img, f"✓ Saved to {output_path} | Seed: {actual_seed} | Size: {width}x{height} | Time: {total_time:.1f}s"
     
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return None, f"❌ Error: {str(e)}"
 
 
