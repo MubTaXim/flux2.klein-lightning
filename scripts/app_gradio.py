@@ -202,11 +202,6 @@ def create_ui():
     
     with gr.Blocks(
         title="FLUX.2 Klein 9B",
-        theme=gr.themes.Soft(primary_hue="purple"),
-        css="""
-        .generate-btn { min-height: 60px !important; }
-        .status-box { font-family: monospace; }
-        """
     ) as demo:
         
         gr.Markdown("""
@@ -284,7 +279,6 @@ def create_ui():
                 output_image = gr.Image(
                     label="Generated Image",
                     type="pil",
-                    show_download_button=True,
                     height=512
                 )
                 status = gr.Textbox(
@@ -341,5 +335,5 @@ if __name__ == "__main__":
         server_name="0.0.0.0",
         server_port=7860,
         share=True,
-        show_error=True
+        show_error=True,
     )
