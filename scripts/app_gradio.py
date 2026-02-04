@@ -151,7 +151,7 @@ def generate_image(
             ctx, ctx_ids = batched_prc_txt(ctx)
             log("Prompt encoded")
             
-            # Step 3: Move text encoder off, flow model on
+            # Step 3: Prepare models for denoising
             if cpu_offload:
                 log("CPU offload: moving text encoder to CPU, flow model to GPU...")
                 text_encoder.cpu()
@@ -159,6 +159,13 @@ def generate_image(
                 torch.cuda.empty_cache()
                 model.cuda()
                 log("Flow model on GPU")
+            else:
+                # No CPU offload - ensure everything is on GPU
+                log("No CPU offload: ensuring all models are on GPU...")
+                text_encoder.cuda()
+                model.cuda()
+                ae.cuda()
+                log("All models on GPU (no offload)")
             
             # Step 4: Create noise
             progress(0.3, desc="Creating noise...")
@@ -193,6 +200,9 @@ def generate_image(
                 torch.cuda.empty_cache()
                 ae.cuda()
                 log("AE on GPU")
+            else:
+                # Already on GPU, just log
+                log("AE already on GPU (no offload)")
             
             # Step 7: Decode
             log("Decoding latents...")
