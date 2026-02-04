@@ -122,17 +122,33 @@ def load_ae(model_name: str, device: str | torch.device = "cuda") -> AutoEncoder
         assert os.path.exists(weight_path), f"Provided weight path {weight_path} does not exist"
     else:
         # download from huggingface
-        try:
-            weight_path = huggingface_hub.hf_hub_download(
-                repo_id=config["repo_id"],
-                filename=config["filename_ae"],
-                repo_type="model",
-            )
-        except huggingface_hub.errors.RepositoryNotFoundError:
+        # Try multiple possible filenames - BFL repos use different naming conventions
+        possible_filenames = [
+            "vae/diffusion_pytorch_model.safetensors",  # New FLUX.2 format
+            config["filename_ae"],  # Original ae.safetensors
+        ]
+        
+        weight_path = None
+        last_error = None
+        
+        for filename in possible_filenames:
+            try:
+                weight_path = huggingface_hub.hf_hub_download(
+                    repo_id=config["repo_id"],
+                    filename=filename,
+                    repo_type="model",
+                )
+                print(f"Found VAE at: {filename}")
+                break
+            except Exception as e:
+                last_error = e
+                continue
+        
+        if weight_path is None:
             print(
-                f"Failed to access the model repository. Please check your internet "
-                f"connection and make sure you've access to {config['repo_id']}."
-                "Stopping."
+                f"Failed to access the VAE. Tried: {possible_filenames}. "
+                f"Please check your internet connection and make sure you've access to {config['repo_id']}. "
+                f"Last error: {last_error}"
             )
             sys.exit(1)
 
